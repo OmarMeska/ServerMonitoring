@@ -1,0 +1,102 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>Alert Monitor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+        }
+
+        h2 {
+            color: #00ff88;
+        }
+
+        .alert-box {
+            padding: 12px;
+            margin: 8px 0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .anomaly {
+            background: #ff8c004d;
+            border-left: 4px solid orange;
+        }
+
+        .highusage {
+            background: #ff00004d;
+            border-left: 4px solid red;
+        }
+
+        .info {
+            background: #0088ff4d;
+            border-left: 4px solid #0088ff;
+        }
+
+        #status {
+            font-size: 13px;
+            margin-bottom: 20px;
+        }
+
+        #alerts {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <h2>Server Monitor — Live Alerts</h2>
+    <div id="status">Connecting to SignalR hub...</div>
+    <div id="alerts"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <script>
+        const alertsDiv = document.getElementById("alerts");
+        const statusDiv = document.getElementById("status");
+
+        function addAlert(cssClass, icon, data) {
+            const time = new Date().toLocaleTimeString();
+            alertsDiv.innerHTML =
+                `<div class="alert-box ${cssClass}">
+                        ${icon} <strong>[${time}]</strong> ${data.message}
+                        <br/><small>Server: ${data.serverIdentifier} |
+                        Metric: ${data.metric}</small>
+                    </div>` + alertsDiv.innerHTML;
+        }
+
+        const connection = new signalR.HubConnectionBuilder()
+            .withUrl("/hubs/monitoring")
+            .withAutomaticReconnect()
+            .build();
+
+        connection.on("AnomalyAlert", (alert) => {
+            addAlert("anomaly", "⚠️", alert);
+        });
+
+        connection.on("HighUsageAlert", (alert) => {
+            addAlert("highusage", "🔴", alert);
+        });
+
+        connection.onreconnecting(() => {
+            statusDiv.innerHTML = "⚠️ Reconnecting to SignalR hub...";
+        });
+
+        connection.onreconnected(() => {
+            statusDiv.innerHTML = "✅ Reconnected to SignalR hub.";
+        });
+
+        connection.start()
+            .then(() => {
+                statusDiv.innerHTML = "✅ Connected to SignalR hub — waiting for alerts...";
+                console.log("SignalR connected.");
+            })
+            .catch(err => {
+                statusDiv.innerHTML = "❌ Failed to connect: " + err;
+                console.error(err);
+            });
+    </script>
+</body>
+</html>
