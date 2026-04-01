@@ -1,135 +1,167 @@
-# ServerMonitor — Server Statistics Collection Service
+# Server Monitoring System
 
-A .NET Worker Service that collects server performance metrics (CPU, memory) at configurable intervals and publishes them to a RabbitMQ message queue using a topic exchange.
+A distributed, event-driven server health monitoring system built on .NET 10. It continuously collects server performance metrics, stores them historically, and sends real-time alerts when anomalies or dangerous usage levels are detected.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Project Type](#project-type)
-- [Project Structure](#project-structure)
-- [How It Works](#how-it-works)
+- [System Overview](#system-overview)
+- [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
-- [NuGet Packages](#nuget-packages)
-- [Configuration](#configuration)
-- [RabbitMQ Setup](#rabbitmq-setup)
-- [Running the Project](#running-the-project)
-- [Verifying Messages](#verifying-messages)
-- [Architecture & Design Decisions](#architecture--design-decisions)
+- [Project Structure](#project-structure)
+- [Task 1 — ServerMonitor](#task-1--servermonitor)
+- [Task 2 — AnomalyDetectionService](#task-2--anomalydetectionservice)
+- [Running Both Services Together](#running-both-services-together)
+- [Verifying the Full Flow](#verifying-the-full-flow)
+- [Scaling](#scaling)
 
 ---
 
-## Overview
+## System Overview
 
-ServerMonitor is a background service that:
+The system is composed of two independently deployable .NET services that communicate exclusively through a RabbitMQ message broker:
 
-- Collects **CPU usage**, **available memory**, and **used memory** from the host machine at regular intervals
-- Wraps the collected data into a `ServerStatistics` object with a timestamp
-- Publishes the object as a JSON message to RabbitMQ under the topic `ServerStatistics.<ServerIdentifier>`
+- **ServerMonitor** runs on each machine being monitored. It reads CPU and memory metrics from the OS and publishes them to RabbitMQ every configurable interval.
+- **AnomalyDetectionService** runs on a central monitoring server. It consumes those messages, persists them to MongoDB, and sends real-time alerts via SignalR when thresholds are exceeded.
 
----
-
-## Project Type
-
-**.NET Worker Service** (`Microsoft.NET.Sdk.Worker`)
-
-The project runs as a long-running background process. It does not have a UI or HTTP endpoint. It is designed to run continuously as a Windows Service or Linux systemd daemon.
+| | ServerMonitor | AnomalyDetectionService |
+|---|---|---|
+| Role | Data Producer | Data Consumer & Analyzer |
+| Project Type | Worker Service | Web Application |
+| Deployed On | Each monitored server | Central monitoring server |
+| Outputs To | RabbitMQ exchange | MongoDB + SignalR clients |
 
 ---
 
-## Project Structure
+## Architecture
 
 ```
-ServerMonitor/
-├── Abstractions/
-│   └── IMessagePublisher.cs        # Interface for message queue abstraction
-├── Configuration/
-│   └── ServerStatisticsConfig.cs   # Strongly-typed config binding
-├── Models/
-│   └── ServerStatistics.cs         # Data model for collected metrics
-├── Services/
-│   └── ServerStatisticsService.cs  # Background worker (main logic)
-├── Messaging/
-│   └── RabbitMqPublisher.cs        # RabbitMQ implementation of IMessagePublisher
-├── Program.cs                      # Host setup and DI registration
-└── appsettings.json                # Configuration file
-```
-
----
-
-## How It Works
-
-```
-ServerStatisticsService (BackgroundService)
-        │
-        │  every SamplingIntervalSeconds
-        ▼
-   CollectStatistics()
-   - PerformanceCounter → CPU %
-   - PerformanceCounter → Available Memory (MB)
-   - GC.GetGCMemoryInfo() → Total Memory (MB)
-        │
-        ▼
-   ServerStatistics object
-   { MemoryUsage, AvailableMemory, CpuUsage, Timestamp }
-        │
-        ▼
-   IMessagePublisher.PublishAsync(topic, payload)
-        │
-        ▼
-   RabbitMqPublisher
-   - Exchange: server.monitoring (topic)
-   - Routing key: ServerStatistics.<ServerIdentifier>
-   - Queue: server.statistics.queue
+┌─────────────────────┐         ┌─────────────────┐         ┌──────────────────────────┐
+│   ServerMonitor     │         │    RabbitMQ      │         │  AnomalyDetectionService │
+│  (each server)      │         │    (broker)      │         │   (central server)       │
+│                     │         │                  │         │                          │
+│  PerformanceCounter │──────▶  │ server.monitoring│──────▶  │  RabbitMqConsumer        │
+│  collects metrics   │  topic  │ exchange         │  topic  │  deserializes message    │
+│  every 60 seconds   │  msg    │                  │  msg    │         │                │
+│                     │         │  server.stats    │         │         ▼                │
+│  Publishes to:      │         │  .queue          │         │  SaveAsync()             │
+│  ServerStatistics   │         │                  │         │  → MongoDB               │
+│  .<ServerId>        │         └─────────────────┘         │         │                │
+└─────────────────────┘                                      │         ▼                │
+                                                             │  RunChecksAsync()        │
+                                                             │  → Anomaly Alert?        │
+                                                             │  → High Usage Alert?     │
+                                                             │         │                │
+                                                             │         ▼                │
+                                                             │  SignalR Hub             │
+                                                             │  /hubs/monitoring        │
+                                                             └──────────────────────────┘
+                                                                        │
+                                                                        ▼
+                                                             ┌──────────────────────────┐
+                                                             │   Browser Dashboard      │
+                                                             │   Real-time alerts       │
+                                                             └──────────────────────────┘
 ```
 
 ---
 
 ## Prerequisites
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download)
-- [RabbitMQ 3+](https://www.rabbitmq.com/install-windows.html) running locally
-- [Erlang/OTP](https://www.erlang.org/downloads) (required by RabbitMQ on Windows)
-- Windows OS (required for `System.Diagnostics.PerformanceCounter`)
+Make sure all of the following are installed and running before starting:
+
+| Requirement | Version | Purpose | Download |
+|---|---|---|---|
+| .NET SDK | 10.0+ | Build and run both projects | https://dotnet.microsoft.com/download |
+| RabbitMQ | 3+ | Message broker between services | https://www.rabbitmq.com/install-windows.html |
+| Erlang/OTP | Any recent | Required by RabbitMQ on Windows | https://www.erlang.org/downloads |
+| MongoDB | 6+ | Persistent storage for metrics | https://www.mongodb.com/try/download/community |
+
 
 ---
 
-## NuGet Packages
+## Project Structure
 
-| Package | Version | Purpose |
-|---|---|---|
-| `RabbitMQ.Client` | 6.8.1 | Connect and publish to RabbitMQ |
-| `System.Diagnostics.PerformanceCounter` | 8.0.0 | Collect CPU and memory metrics |
+```
+ServerMonitoring/
+│
+├── ServerMonitor/                          ← Task 1: Collects & publishes metrics
+│   ├── Abstractions/
+│   │   └── IMessagePublisher.cs            # Message queue abstraction
+│   ├── Configuration/
+│   │   └── ServerStatisticsConfig.cs       # Strongly-typed config binding
+│   ├── Models/
+│   │   └── ServerStatistics.cs             # Metrics data model
+│   ├── Services/
+│   │   └── ServerStatisticsService.cs      # Background worker (main logic)
+│   ├── Messaging/
+│   │   └── RabbitMqPublisher.cs            # RabbitMQ implementation
+│   ├── Program.cs
+│   ├── appsettings.json
+│   └── ServerMonitor.csproj
+│
+├── AnomalyDetectionService/                ← Task 2: Consumes, stores & alerts
+│   ├── Abstractions/
+│   │   ├── IMessageConsumer.cs             # Message queue abstraction
+│   │   └── IStatisticsRepository.cs        # Database abstraction
+│   ├── Configuration/
+│   │   ├── AnomalyDetectionConfig.cs       # Threshold config
+│   │   └── SignalRConfig.cs                # SignalR hub URL config
+│   ├── Models/
+│   │   └── ServerStatistics.cs             # Metrics model with MongoDB annotations
+│   ├── Services/
+│   │   ├── AnomalyDetectionWorker.cs       # Background worker (main logic)
+│   │   └── AlertService.cs                 # Sends SignalR alerts
+│   ├── Messaging/
+│   │   └── RabbitMqConsumer.cs             # RabbitMQ implementation
+│   ├── Persistence/
+│   │   └── MongoStatisticsRepository.cs    # MongoDB implementation
+│   ├── Hubs/
+│   │   └── MonitoringHub.cs                # SignalR hub endpoint
+│   ├── wwwroot/
+│   │   └── test.html                       # Browser test page for live alerts
+│   ├── Program.cs
+│   ├── appsettings.json
+│   └── AnomalyDetectionService.csproj
+│
+└── README.md                              
+```
 
-Install via CLI:
+---
+
+## Task 1 — ServerMonitor
+
+### Purpose
+
+A .NET Worker Service that runs on each machine being monitored. It collects CPU usage, available memory, and used memory from the OS at a configurable interval and publishes the data as a JSON message to RabbitMQ.
+
+### How It Works
+
+```
+Every SamplingIntervalSeconds:
+    PerformanceCounter → CPU %, Available Memory (MB)
+    GC.GetGCMemoryInfo() → Total Memory (MB)
+    Used Memory = Total - Available
+          │
+          ▼
+    ServerStatistics { MemoryUsage, AvailableMemory, CpuUsage, Timestamp }
+          │
+          ▼
+    IMessagePublisher.PublishAsync("ServerStatistics.Server123", stats)
+          │
+          ▼
+    RabbitMQ → server.monitoring exchange → server.statistics.queue
+```
+
+### NuGet Packages
 
 ```bash
 dotnet add package RabbitMQ.Client --version 6.8.1
 dotnet add package System.Diagnostics.PerformanceCounter
 ```
 
-The `.csproj` should look like:
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk.Worker">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="RabbitMQ.Client" Version="6.8.1" />
-    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="8.0.0" />
-  </ItemGroup>
-</Project>
-```
-
----
-
-## Configuration
-
-Edit `appsettings.json` to configure the sampling interval and server identifier:
+### Configuration — `ServerMonitor/appsettings.json`
 
 ```json
 {
@@ -139,106 +171,171 @@ Edit `appsettings.json` to configure the sampling interval and server identifier
   },
   "RabbitMQ": {
     "Host": "localhost"
-  },
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "ServerMonitor": "Debug"
-    }
   }
 }
 ```
 
 | Setting | Description | Default |
 |---|---|---|
-| `SamplingIntervalSeconds` | How often to collect and publish metrics | `60` |
-| `ServerIdentifier` | Appended to the topic name: `ServerStatistics.<id>` | `Server123` |
-| `RabbitMQ:Host` | Hostname of the RabbitMQ broker | `localhost` |
+| `SamplingIntervalSeconds` | How often metrics are collected and published | `60` |
+| `ServerIdentifier` | Unique name for this server, appended to the topic | `Server123` |
+| `RabbitMQ:Host` | Hostname or IP of the RabbitMQ broker | `localhost` |
+
 
 ---
 
-## RabbitMQ Setup
+## Task 2 — AnomalyDetectionService
 
-### Option 1 — Windows Installation
+### Purpose
 
-1. Install [Erlang/OTP](https://www.erlang.org/downloads)
-2. Install [RabbitMQ](https://www.rabbitmq.com/install-windows.html)
-3. Open PowerShell **as Administrator** and navigate to the sbin folder:
+A .NET Web Application that consumes server metrics from RabbitMQ, persists every record to MongoDB, and sends real-time alerts via SignalR when anomalies or high usage is detected.
 
-```powershell
-cd "C:\Program Files\RabbitMQ Server\rabbitmq_server-4.x.x\sbin"
+### How It Works
+
+```
+RabbitMQ message received
+        │
+        ▼
+Deserialize JSON → ServerStatistics object
+        │
+        ├── GetLatestAsync()  → fetch previous record from MongoDB
+        ├── SaveAsync()       → persist current record to MongoDB
+        └── RunChecksAsync()
+                │
+                ├── Memory Anomaly?  ──▶ SignalR "AnomalyAlert"
+                ├── CPU Anomaly?     ──▶ SignalR "AnomalyAlert"
+                ├── Memory High?     ──▶ SignalR "HighUsageAlert"
+                └── CPU High?        ──▶ SignalR "HighUsageAlert"
 ```
 
-4. Install and start the service:
+### Alert Logic
 
-```powershell
-.\rabbitmq-service.bat install
-.\rabbitmq-service.bat start
+All thresholds are configurable in `appsettings.json`. No code changes are needed to adjust sensitivity.
+
+**Anomaly Alerts** — detect sudden spikes by comparing to the previous sample:
+
+```
+Memory Anomaly: CurrentMemoryUsage > PreviousMemoryUsage * (1 + MemoryUsageAnomalyThresholdPercentage)
+CPU Anomaly:    CurrentCpuUsage    > PreviousCpuUsage    * (1 + CpuUsageAnomalyThresholdPercentage)
 ```
 
-5. Fix Erlang cookie mismatch (if `rabbitmqctl.bat status` fails):
+**High Usage Alerts** — detect sustained dangerous levels on every sample:
 
-```powershell
-Copy-Item "C:\Windows\System32\config\systemprofile\.erlang.cookie" `
-          -Destination "C:\Users\<YourUsername>\.erlang.cookie" -Force
-.\rabbitmq-service.bat stop
-.\rabbitmq-service.bat start
+```
+Memory High: (CurrentMemoryUsage / (CurrentMemoryUsage + CurrentAvailableMemory)) > MemoryUsageThresholdPercentage
+CPU High:    CurrentCpuUsage > CpuUsageThresholdPercentage
 ```
 
-6. Enable the Management UI:
-
-```powershell
-.\rabbitmq-plugins.bat enable rabbitmq_management
-```
-
-7. Verify RabbitMQ is running:
-
-```powershell
-.\rabbitmqctl.bat status
-```
-
-### Option 2 — Docker (Recommended)
+### NuGet Packages
 
 ```bash
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+dotnet add package RabbitMQ.Client --version 6.8.1
+dotnet add package MongoDB.Driver --version 2.28.0
+dotnet add package Microsoft.AspNetCore.SignalR
 ```
 
-### Management UI
-
-Open **http://localhost:15672** in your browser.
-
-- Username: `guest`
-- Password: `guest`
-
----
-
-## Running the Project
-
-```bash
-dotnet run
-```
-
-Or press **F5** in Visual Studio.
-
-On startup the service will:
-
-1. Connect to RabbitMQ on port `5672`
-2. Declare the `server.monitoring` topic exchange
-3. Declare and bind `server.statistics.queue` with routing key `ServerStatistics.#`
-4. Begin collecting and publishing metrics every `SamplingIntervalSeconds`
-
----
-
-## Verifying Messages
-
-1. Open **http://localhost:15672**
-2. Go to the **Queues** tab → click `server.statistics.queue`
-3. Scroll to **Get Messages** → click **Get Message(s)**
-
-You should see a JSON payload like:
+### Configuration — `AnomalyDetectionService/appsettings.json`
 
 ```json
 {
+  "AnomalyDetectionConfig": {
+    "MemoryUsageAnomalyThresholdPercentage": 0.4,
+    "CpuUsageAnomalyThresholdPercentage": 0.5,
+    "MemoryUsageThresholdPercentage": 0.8,
+    "CpuUsageThresholdPercentage": 0.9
+  },
+  "SignalRConfig": {
+    "SignalRUrl": "http://localhost:5000/hubs/monitoring"
+  },
+  "MongoDB": {
+    "ConnectionString": "mongodb://localhost:27017",
+    "Database": "ServerMonitor",
+    "Collection": "ServerStatistics"
+  },
+  "RabbitMQ": {
+    "Host": "localhost"
+  }
+}
+```
+
+| Setting | Description | Default |
+|---|---|---|
+| `MemoryUsageAnomalyThresholdPercentage` | Alert if memory jumps more than X% above previous sample | `0.4` (40%) |
+| `CpuUsageAnomalyThresholdPercentage` | Alert if CPU jumps more than X% above previous sample | `0.5` (50%) |
+| `MemoryUsageThresholdPercentage` | Alert if memory usage exceeds X% of total memory | `0.8` (80%) |
+| `CpuUsageThresholdPercentage` | Alert if CPU usage exceeds X% | `0.9` (90%) |
+
+---
+
+## Running Both Services Together
+
+Both services must be running simultaneously along with RabbitMQ and MongoDB.
+
+### Option 1 — Visual Studio (Recommended)
+
+1. Open `ServerMonitoring.sln`
+2. Right-click the Solution → **Set Startup Projects**
+3. Select **Multiple startup projects**
+4. Set both `ServerMonitor` and `AnomalyDetectionService` to **Start**
+5. Press **F5**
+
+### Option 2 — Two Terminal Windows
+
+Terminal 1:
+```bash
+cd ServerMonitor
+dotnet run
+```
+
+Terminal 2:
+```bash
+cd AnomalyDetectionService
+dotnet run
+```
+
+### Expected Output
+
+**ServerMonitor terminal:**
+```
+info: ServerStatisticsService[0]
+      ServerStatisticsService started. Sampling every 60s for server 'Server123'.
+info: ServerStatisticsService[0]
+      Published message to topic 'ServerStatistics.Server123'.
+```
+
+**AnomalyDetectionService terminal:**
+```
+info: AnomalyDetectionWorker[0]
+      AnomalyDetectionWorker started.
+info: RabbitMqConsumer[0]
+      Started consuming from queue 'server.statistics.queue' with pattern 'ServerStatistics.*'.
+info: MongoStatisticsRepository[0]
+      MongoDB repository initialized — ServerMonitor/ServerStatistics.
+dbug: MongoStatisticsRepository[0]
+      Saved statistics for server 'Server123'.
+```
+
+---
+
+## Verifying the Full Flow
+
+### 1. RabbitMQ Management UI — http://localhost:15672
+
+Login with `guest` / `guest`
+
+- **Exchanges tab** → `server.monitoring` exchange should be visible with type `topic`
+- **Queues tab** → `server.statistics.queue` should show incoming message rates
+
+### 2. MongoDB — MongoDB Compass
+
+Connect to `mongodb://localhost:27017` and navigate to **ServerMonitor → ServerStatistics**.
+
+You should see a new document inserted every 60 seconds:
+
+```json
+{
+  "_id": "661f1a2b3c4d5e6f7a8b9c0d",
+  "ServerIdentifier": "Server123",
   "MemoryUsage": 4821.35,
   "AvailableMemory": 11402.12,
   "CpuUsage": 3.47,
@@ -246,25 +343,63 @@ You should see a JSON payload like:
 }
 ```
 
+### 3. SignalR Alerts — http://localhost:5000/test.html
+
+Open the test page in your browser. You should see:
+
+```
+✅ Connected to SignalR hub — waiting for alerts...
+```
+
+### 4. Trigger Alerts Manually
+
+Instead of waiting 60 seconds, publish a test message directly from the RabbitMQ Management UI:
+
+Go to **Exchanges → server.monitoring → Publish Message**
+
+Set routing key to `ServerStatistics.Server123` and publish:
+
+```json
+{
+  "MemoryUsage": 15000.00,
+  "AvailableMemory": 500.00,
+  "CpuUsage": 95.00,
+  "Timestamp": "2026-04-01T10:00:00Z"
+}
+```
+
+The browser should immediately show:
+
+```
+🔴 High usage on Server123: MemoryUsage at 96.8%, threshold is 80.0%
+⚠️ Anomaly detected on Server123: MemoryUsage jumped from 4821.35 to 15000.00
+```
+
 ---
 
-## Architecture & Design Decisions
+## Scaling
 
-### `IMessagePublisher` Abstraction
+### Monitoring More Servers
 
-The `ServerStatisticsService` only depends on `IMessagePublisher`, never on RabbitMQ directly. This means you can swap RabbitMQ for Azure Service Bus, Kafka, or an in-memory stub for unit testing with a single line change in `Program.cs`.
+Deploy ServerMonitor on each additional machine with a unique `ServerIdentifier`:
 
-### `BackgroundService`
+```json
+{ "ServerStatisticsConfig": { "ServerIdentifier": "WebServer01" } }
+{ "ServerStatisticsConfig": { "ServerIdentifier": "DatabaseServer" } }
+{ "ServerStatisticsConfig": { "ServerIdentifier": "ApiGateway" } }
+```
 
-Inheriting from `BackgroundService` integrates with the .NET hosted service lifecycle. The service respects `CancellationToken` for graceful shutdown on `Ctrl+C` or system SIGTERM signals.
+No changes to AnomalyDetectionService or RabbitMQ are needed. The `ServerStatistics.*` wildcard binding automatically picks up all new servers.
 
-### CPU Counter Priming
+### Scaling AnomalyDetectionService
 
-`PerformanceCounter` always returns `0` on its very first read. The service primes the counter with a 1-second warm-up before entering the sampling loop, ensuring the first published value is accurate.
+Run multiple instances pointing at the same RabbitMQ broker. RabbitMQ distributes messages across all instances automatically using round-robin.
 
-### Topic Exchange
+### Fault Tolerance
 
-Messages are published to a RabbitMQ **topic exchange** with routing key `ServerStatistics.Server123`. Consumers can subscribe to:
-
-- `ServerStatistics.#` — receive stats from all servers
-- `ServerStatistics.Server123` — receive stats from one specific server
+| Component Goes Down | Effect | Recovery |
+|---|---|---|
+| ServerMonitor | No new messages published | Restarts and resumes publishing automatically |
+| AnomalyDetectionService | Messages queue up in RabbitMQ (durable — no data loss) | Restarts and processes all queued messages in order |
+| RabbitMQ | Both services log errors and retry | Both reconnect automatically when RabbitMQ restarts |
+| MongoDB | AnomalyDetectionService fails to start | Start MongoDB, restart the service |
